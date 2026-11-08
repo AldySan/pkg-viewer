@@ -4940,40 +4940,56 @@ def _exfat_result(fs, path, size, platform, inner_name=None):
 
 
 def parse_trp(data):
-    """Inner files of a trophy00.trp (PS4/PS5): [{name, off, size}] or [].
+    """Inner files of a TROPHY.TRP / trophy00.trp (PS3/PS4/PS5):
+    [{name, off, size}] or [].
 
-    Layout (verified on retail TRP): u32 magic DCA24D00, u32be count @4,
-    u64be total @8, u32be header 0x4d @0x10, u32be entry-size 0x40 @0x14,
-    32-byte digest @0x18, entries @0x38: {u64 unk, u64be off, u64be size,
-    u64 flags, u64 unk, char name[24]}. Strict validation — [] on doubt.
+    Real retail layout (cross-checked against RPCS3's TRP.h, psdevwiki
+    and three retail-file extractors): 0x40-byte header — u32 magic
+    DCA24D00, u32 version @4, u64be total @8, u32be count @0x10, u32be
+    entry-size 0x40 @0x14, u32 dev flag @0x18, sha1[20] @0x1C, pad[16]
+    @0x30 — then count entries of 0x40 bytes: char name[32] @+0x00,
+    u64be off @+0x20, u64be size @+0x28. Strict validation — [] on doubt.
     """
     try:
-        if not data or len(data) < 0x38 or data[:4] != b"\xdc\xa2M\x00":
+        if not data or len(data) < 0x80 or data[:4] != b"\xdc\xa2M\x00":
             return []
         import struct as _st
-        count = _st.unpack_from(">I", data, 4)[0]
-        total = _st.unpack_from(">Q", data, 8)[0]
+        count = _st.unpack_from(">I", data, 0x10)[0]
+        total = _st.unpack_from(">Q", data, 0x08)[0]
         esize = _st.unpack_from(">I", data, 0x14)[0]
-        if not (1 <= count <= 10000) or total != len(data):
+        if not (1 <= count <= 10000) or esize != 0x40:
             return []
-        if esize != 0x40:
+        # header total must not exceed what we hold (equal for a
+        # standalone file; a padded embed is still fine)
+        if total < 0x80 or total > len(data):
             return []
-        hsize = 0x38  # entries start after the 32-byte digest
+        hsize = 0x40  # entries start right after the fixed header
         out = []
         for i in range(count):
             eo = hsize + i * esize
             if eo + esize > len(data):
                 return []
-            off = _st.unpack_from(">Q", data, eo + 8)[0]
-            size = _st.unpack_from(">Q", data, eo + 16)[0]
-            nm = data[eo + 40:eo + 64].split(b"\x00")[0].decode(
+            off = _st.unpack_from(">Q", data, eo + 0x20)[0]
+            size = _st.unpack_from(">Q", data, eo + 0x28)[0]
+            nm = data[eo:eo + 32].split(b"\x00")[0].decode(
                 "ascii", errors="replace")
-            if not nm or off + size > len(data):
+            if not nm or off > len(data) or size > len(data) - off:
                 return []
             out.append({"name": nm, "off": off, "size": size})
         return out
     except Exception:
         return []
+
+
+def npcommid_from_path(path):
+    """NP communication id from a TROPDIR/<NPWRxxxxx_00>/TROPHY.TRP entry
+    path (the folder name IS the id the ESFM key derives from), or None."""
+    try:
+        import re as _re
+        m = _re.search(r"NP[A-Z]{2}[0-9]{5}_[0-9]{2}", path or "")
+        return m.group(0) if m else None
+    except Exception:
+        return None
 
 
 # PS4/PS5 trophy ESFM decryption (psdevwiki: public Trophy_Key; per-title
@@ -7725,9 +7741,11 @@ def run_gui(start_path=None):
                         entry.get("name", ""), _npid, _trs, _icons, _grades))
                     return
                 _inner = parse_trp(_td)
+                # PS3 packs carry TROPCONF.SFM; PS4 packs TROP.ESFM /
+                # TROPCONF.ESFM / per-language TROP_xx.ESFM
                 _cands = [t for t in _inner
                           if t["name"].upper().startswith("TROP")
-                          and t["name"].upper().endswith(".ESFM")
+                          and t["name"].upper().endswith((".ESFM", ".SFM"))
                           and t["size"] > 0]
                 # language files (TROP_00.ESFM) carry names/details;
                 # bare TROP.ESFM only has id/type/hidden skeleton
@@ -7735,13 +7753,33 @@ def run_gui(start_path=None):
                     _un = t["name"].upper()
                     if _un == "TROP.ESFM":
                         return (1, _un)
-                    if _un == "TROPCONF.ESFM":
+                    if _un in ("TROPCONF.ESFM", "TROPCONF.SFM"):
                         return (2, _un)
                     return (0, _un)
                 _cands.sort(key=_tkey)
+                # direct ids first: PARAM.SFO/param.json meta, then the
+                # TROPDIR/<NPWRxxxxx_00>/ folder in the entry path (PS3
+                # folders/PKGs spell it out) — avoids the brute force
+                _direct = []
+                for _k in ("NP_COMMUNICATION_ID", "npCommunicationId"):
+                    _v = (result.get("meta") or {}).get(_k)
+                    if _v and _v not in _direct:
+                        _direct.append(_v)
+                _pid = npcommid_from_path(entry.get("name") or "")
+                if _pid and _pid not in _direct:
+                    _direct.append(_pid)
                 _npid, _xml, _fallback = None, None, None
                 for _t in _cands:
                     _blob = _td[_t["off"]:_t["off"] + _t["size"]]
+                    for _did in _direct:
+                        _dx = decrypt_esfm(_blob, _did)
+                        if _dx:
+                            _ts = parse_trophy_xml(_dx)
+                            if any(_t2.get("name") for _t2 in _ts):
+                                _npid, _xml = _did, _dx
+                                break
+                    if _xml is not None:
+                        break
                     _n, _x = bruteforce_npid(_blob)
                     if _x and _fallback is None:
                         _fallback = (_n, _x)
